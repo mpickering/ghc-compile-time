@@ -1,0 +1,3 @@
+#! /usr/bin/env bash
+
+/home/matt/ghc-debug-ghc/_build/stage1/bin/ghc $@ +RTS -l -ol/home/matt/ghc-compile-time-analyse/eventlogs/ghc.$BASHPID.eventlog
