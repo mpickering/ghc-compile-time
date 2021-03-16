@@ -1,0 +1,139 @@
+commit b0d1209561011f5381dd455618c8c91bca82e14d
+Author: Matthew Pickering <matthewtpickering@gmail.com>
+Date:   Tue Mar 16 22:48:53 2021 +0000
+
+    Add traces for compile time eval
+
+diff --git a/compiler/GHC/Driver/Make.hs b/compiler/GHC/Driver/Make.hs
+index 63e45b7f2a..787cb9cfbf 100644
+--- a/compiler/GHC/Driver/Make.hs
++++ b/compiler/GHC/Driver/Make.hs
+@@ -132,6 +132,7 @@ import System.Directory
+ import System.FilePath
+ import System.IO        ( fixIO )
+ import System.IO.Error  ( isDoesNotExistError )
++import Debug.Trace
+ 
+ import GHC.Conc ( getNumProcessors)
+ 
+@@ -1658,6 +1659,24 @@ upsweep_inst hsc_env mHscMessage mod_index nmods iuid = do
+         runHsc hsc_env $ ioMsgMaybe $ tcRnCheckUnit hsc_env $ VirtUnit iuid
+         pure ()
+ 
++wrapTrace :: ModSummary -> Int -> Int -> IO a -> IO a
++wrapTrace ms k n cont = do
++  let msgm = formatModName (ms_hsc_src ms) (ms_mod_name ms)
++      msg = msgm ++ ":" ++ show k ++ "/" ++ show n
++  traceMarkerIO ("START:" ++ msg)
++  traceMarkerIO ("MOD:" ++ msgm ++ ":" ++ formatDeps (map (unLoc . snd) (ms_srcimps ms)) (map (unLoc . snd) (ms_textual_imps ms)))
++  res <- cont
++  traceMarkerIO ("END:" ++ msg)
++  return res
++
++formatModName :: HscSource -> ModuleName -> String
++formatModName src mn = herald src ++ moduleNameString mn
++    where
++      herald HsBootFile = "(B)"
++      herald _ = ""
++
++formatDeps :: [ModuleName] -> [ModuleName] -> String
++formatDeps src nrm = show (map (formatModName HsBootFile) src ++ map (formatModName HsSrcFile) nrm)
+ 
+ -- | Compile a single module.  Always produce a Linkable for it if
+ -- successful.  If no compilation happened, return the old Linkable.
+@@ -1670,7 +1689,7 @@ upsweep_mod :: HscEnv
+             -> Int  -- total number of modules
+             -> IO HomeModInfo
+ upsweep_mod hsc_env mHscMessage old_hpt (stable_obj, stable_bco) summary mod_index nmods
+-   = let
++   = wrapTrace summary mod_index nmods $  let
+             this_mod_name = ms_mod_name summary
+             this_mod    = ms_mod summary
+             mb_obj_date = ms_obj_date summary
+diff --git a/compiler/GHC/Driver/Pipeline.hs b/compiler/GHC/Driver/Pipeline.hs
+index bf9fbe8405..c9fb48b6cf 100644
+--- a/compiler/GHC/Driver/Pipeline.hs
++++ b/compiler/GHC/Driver/Pipeline.hs
+@@ -115,6 +115,7 @@ import Data.List        ( isInfixOf, intercalate )
+ import Data.Maybe
+ import Data.Version
+ import Data.Either      ( partitionEithers )
++import Debug.Trace
+ 
+ import Data.Time        ( UTCTime )
+ 
+@@ -1095,6 +1096,21 @@ llvmOptions dflags =
+                 ArchRISCV64 -> "lp64d"
+                 _           -> ""
+ 
++formatModName :: HscSource -> ModuleName -> String
++formatModName src mn = herald src ++ moduleNameString mn
++    where
++      herald HsBootFile = "(B)"
++      herald _ = ""
++
++wrapTrace :: HscSource -> ModuleName -> CompPipeline a -> CompPipeline a
++wrapTrace src mn cont = do
++  let msgm = formatModName src mn
++      msg = msgm
++  liftIO $ traceMarkerIO ("CGSTART:" ++ msg)
++  res <- cont
++  liftIO $ traceMarkerIO ("CGEND:" ++ msg)
++  return res
++
+ -- -----------------------------------------------------------------------------
+ -- | Each phase in the pipeline returns the next phase to execute, and the
+ -- name of the file in which the output was placed.
+@@ -1336,7 +1352,7 @@ runPhase (RealPhase (Hsc src_flavour)) input_fn
+         return (HscOut src_flavour mod_name result,
+                 panic "HscOut doesn't have an input filename")
+ 
+-runPhase (HscOut src_flavour mod_name result) _ = do
++runPhase (HscOut src_flavour mod_name result) _ = wrapTrace src_flavour mod_name $ do
+         dflags <- getDynFlags
+         logger <- getLogger
+         location <- getLocation src_flavour mod_name
+diff --git a/compiler/GHC/Tc/Module.hs b/compiler/GHC/Tc/Module.hs
+index 08f7d0f4b1..a3bf456aeb 100644
+--- a/compiler/GHC/Tc/Module.hs
++++ b/compiler/GHC/Tc/Module.hs
+@@ -174,6 +174,7 @@ import Data.Data ( Data )
+ import qualified Data.Set as S
+ import Control.DeepSeq
+ import Control.Monad
++import Debug.Trace
+ 
+ #include "HsVersions.h"
+ 
+@@ -185,6 +186,22 @@ import Control.Monad
+ ************************************************************************
+ -}
+ 
++formatModName :: HscSource -> ModuleName -> String
++formatModName src mn = herald src ++ moduleNameString mn
++    where
++      herald HsBootFile = "(B)"
++      herald _ = ""
++
++wrapTrace :: ModSummary -> IO a -> IO a
++wrapTrace ms cont = do
++  let msgm = formatModName (ms_hsc_src ms) (ms_mod_name ms)
++      msg = msgm
++  traceMarkerIO ("RN:" ++ msg)
++  res <- cont
++  traceMarkerIO ("TC:" ++ msg)
++  return res
++
++
+ -- | Top level entry point for typechecker and renamer
+ tcRnModule :: HscEnv
+            -> ModSummary
+@@ -197,7 +214,7 @@ tcRnModule hsc_env mod_sum save_rn_syntax
+  | RealSrcSpan real_loc _ <- loc
+  = withTiming logger dflags
+               (text "Renamer/typechecker"<+>brackets (ppr this_mod))
+-              (const ()) $
++              (const ()) $ wrapTrace mod_sum $
+    initTc hsc_env hsc_src save_rn_syntax this_mod real_loc $
+           withTcPlugins hsc_env $ withHoleFitPlugins hsc_env $
+ 
