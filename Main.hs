@@ -6,10 +6,13 @@
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE GeneralisedNewtypeDeriving #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -Wall #-}
 module Main(main) where
 
-import Data.Aeson (Value, encode, ToJSON, toJSON)
+import Data.Aeson (Value, encode, ToJSON, toJSON, object, (.=))
 import Data.String
 import Data.Text (Text, append)
 import qualified Data.Text as T
@@ -36,43 +39,75 @@ import qualified Data.OrdPSQ as PS
 import Data.Maybe (fromMaybe, catMaybes)
 import Data.Tuple (swap)
 import Control.Monad (forM_)
+import Text.Read
+import Data.Coerce
 
 
 data Mode = Simple | Hypothetical
 
-
 main :: IO ()
 main = do
   [el] <- getArgs
-  Right events <- readEventLogFromFile el
-  let EL{..} = process events
+  generateDetailed el
+  generateModule el
+
+
+
+detailed :: Mode -> EL -> (Map.Map Node [Node], [Duration Node])
+detailed mode = (\EL{..} -> ( mkDependencyTree mode mods
+                            , mkDurationNode (match spans) ))
+
+generateDetailed :: FilePath -> IO ()
+generateDetailed =
+  generate (detailed Simple)
+
+simple :: EL
+       -> (Map.Map ModuleNode [ModuleNode],
+           [Duration ModuleNode])
+simple = (\EL{..} -> ( Map.mapKeys ModuleNode (coerce mods)
+                       , mkDurationModule (match spans) ) )
+
+generateModule :: FilePath -> IO ()
+generateModule =
+  generate simple
+
+generate :: (Show a, Ord a)
+         => (EL -> (Map.Map a [a], [Duration a]))
+         -> FilePath
+         -> IO ()
+generate f el_f = do
+  Right events <- readEventLogFromFile el_f
+  let el@EL{..} = process events
+      (deps, dur) = f el
       times = [t | (_, _, t) <- spans]
       total_time = maximum times - minimum times
-      mod_spans = (match spans)
-  let h = template (toJSON mod_spans)
+  let insts = toInstants dur
+      h = template (toJSON dur)
   writeFile "test.html" (renderHtml h)
-  writeFile "analyse.py" (genPyDag caps total_time spans (genGraph Simple mod_spans mods))
-  let s = simulate (mkStartOrEnd mod_spans)
+  writeFile "analyse.py" (genPyDag caps total_time insts (genGraph dur deps))
+  let s = simulate insts
   printSimulation "REAL" s
-  let hcaps = [1..20]
-  forM_ hcaps $ \n -> do
-    let hs = simulate . hypothetical Hypothetical mods mod_spans $ n
-    let simple_hs = simulate . hypothetical Simple mods mod_spans $ n
-    compareTime n hs simple_hs
-    printSimulation ("Hypothetical caps=" ++ show n) hs
+  let hcaps = 6
+      g = genGraph dur deps
+      (simple_deps, simple_dur) = detailed Hypothetical el
+      g' = genGraph simple_dur simple_deps
+  let hs = simulate $ toInstants $ hypothetical g' hcaps
+  let simple_hs = simulate $ toInstants $ hypothetical g hcaps
+  printSimulation ("Hypothetical caps=" ++ show hcaps) hs
+  printSimulation ("Real caps=" ++ show hcaps) simple_hs
 
-mkStartOrEnd :: [ModuleSpan] -> [(Text, StartOrEnd, Double)]
-mkStartOrEnd mss =
-  sortBy (comparing (\(_a, _b, c) -> c)) [(name, f p, getTimeSorE ms (f p)) | f <- [Start, End], p <- phases, ms@ModuleSpan{..} <- mss]
+mkDurationNode :: [ModuleSpan] -> [Duration Node]
+mkDurationNode mss =
+  [(Duration (Node name p) (getStartTime ms p) (getPhaseTime ms p)) | p <- phases, ms@ModuleSpan{..} <- mss]
 
 
-compareTime :: Int -> SimState -> SimState -> IO ()
+compareTime :: Int -> SimState a -> SimState a -> IO ()
 compareTime n h c = putStrLn $ (show n) ++ "," ++ (time h) ++ "," ++ (time c)
   where
     time s = show (sum (map snd (Map.toList (durs s))) / 1000)
 
 
-printSimulation :: String -> SimState -> IO ()
+printSimulation :: Show a => String -> SimState a -> IO ()
 printSimulation herald s = do
   putStrLn "-------------------------------"
   putStrLn herald
@@ -82,18 +117,7 @@ printSimulation herald s = do
   printf "TOTAL: %.2fs\n" (sum (map snd durs_list) / 1000)
   putStrLn "Waited for (top 10):"
   let lags' = sortBy (comparing snd) (lags s)
-  mapM_ ((\(c, d) -> printf "%s: %.2fs\n" c (d / 1000))) (take 10 $ reverse (lags'))
-
--- Given a ModuleSpan, generate the times for the different segments
--- In normal mode, there is just one segment for the whole module but
--- in hypothetical mode, there are multiple segments per module.
-genEvents :: ModuleSpan -> [(Node, Double)]
--- This is "normal mode"
---genEvents (ModuleSpan{..}) = [(end - start, name)]
--- This is "hypothetical mode"
-genEvents ms =
-  let mk h = (Node h (name ms),  getPhaseTime ms h)
-  in map mk phases
+  mapM_ ((\(c, d) -> printf "%s: %.2fs\n" (show c) (d / 1000))) (take 10 $ reverse (lags'))
 
 
 getPhaseTime :: ModuleSpan -> Phase -> Double
@@ -129,33 +153,33 @@ C2S = Core-to-Stg
 
 -}
 
-genDepsCurrent :: Text -> [Text] -> [(Node, [Node])]
+genDepsCurrent :: Module -> [Module] -> [(Node, [Node])]
 genDepsCurrent cur_mod deps =
-  (Node Parse cur_mod, map (Node CodeGen) deps)
+  (Node cur_mod Parse, map (\d -> Node d CodeGen) deps)
   : intraModDeps cur_mod
 
-intraModDeps :: Text -> [(Node, [Node])]
+intraModDeps :: Module -> [(Node, [Node])]
 intraModDeps cur_mod =
-  (Node CodeGen cur_mod, [Node TypeCheck cur_mod])
-  : (Node TypeCheck cur_mod, [Node Parse cur_mod])
+  (Node cur_mod CodeGen, [Node cur_mod TypeCheck])
+  : (Node cur_mod TypeCheck, [Node cur_mod Parse])
   : []
 
-genDepsOneHypothetical :: Text -> [Text] -> [(Node, [Node])]
+genDepsOneHypothetical :: Module -> [Module] -> [(Node, [Node])]
 genDepsOneHypothetical cur_mod deps =
   let mk = Node
   in
   -- Step 1: P has no deps
-  (mk Parse cur_mod, [])
+  (mk cur_mod Parse, [])
   :
   -- Step 2: Rn depends on Tc
-  (mk TypeCheck cur_mod, map (mk TypeCheck) deps)
+  (mk cur_mod TypeCheck, map (\d -> mk d TypeCheck) deps)
   :
   -- Step 3: CGStart depends on CGEnd
-  (mk CodeGen cur_mod, map (mk CodeGen) deps)
+  (mk cur_mod CodeGen , map (\d -> mk d CodeGen) deps)
   : intraModDeps cur_mod
 
 
-mkDependencyTree :: Mode -> Map.Map Text [Text] -> Map.Map Node [Node]
+mkDependencyTree :: Mode -> Map.Map Module [Module] -> Map.Map Node [Node]
 mkDependencyTree mode mod_deps =
   Map.fromListWith (++) (concatMap (uncurry gen) ((Map.toList (Map.map (intersect home_mods) mod_deps))))
   where
@@ -164,16 +188,27 @@ mkDependencyTree mode mod_deps =
             Simple -> genDepsCurrent
             Hypothetical -> genDepsOneHypothetical
 
-genGraph :: Mode -> [ModuleSpan] -> Map.Map Text [Text] -> Map.Map Node (Double, [Node])
-genGraph mode mss mod_deps = final_map
+mkDurationModule :: [ModuleSpan] -> [Duration ModuleNode]
+mkDurationModule mss =
+  [Duration (ModuleNode (name ms)) (start ms) (end ms - start ms) | ms <- mss]
+
+
+
+-- | This prunes the dependencies so that only nodes with times are kept in the graph.
+genGraph :: Ord a
+          => [Duration a]
+          -> Map.Map a [a] -- Dependencies
+          -> Map.Map a (Double, [a])
+genGraph dur mod_deps = final_map
   where
-    home_mods_map = Map.fromList (concatMap genEvents mss)
-    mod_deps' = mkDependencyTree mode mod_deps
-    final_map = Map.merge Map.dropMissing Map.dropMissing (Map.zipWithMatched (\_ time mods -> (time, mods))) home_mods_map mod_deps'
+    times = Map.fromList [(n, d) | Duration n _s d <- dur]
+    care = Map.keys times
+    final_map = Map.merge Map.dropMissing Map.dropMissing (Map.zipWithMatched (\_ time mods -> (time, care `intersect` mods))) times mod_deps
+
 
 
 -- Start/End is in milliseconds
-data ModuleSpan = ModuleSpan { name :: Text
+data ModuleSpan = ModuleSpan { name :: Module
                              , start :: Double
                              , rn :: Double
                              , tc :: Double
@@ -182,21 +217,62 @@ data ModuleSpan = ModuleSpan { name :: Text
                              , end :: Double } deriving (Generic, Show)
 
 deriving instance ToJSON ModuleSpan
+deriving instance ToJSON Module
 
 data Marker = StartComp | RN | TC | CGStart | CGEnd | EndComp deriving (Show, Ord, Eq, Enum)
 
 data Phase = Parse | TypeCheck | CodeGen deriving (Show, Enum, Ord, Eq)
 
-data Node = Node Phase Text deriving (Show, Ord, Eq)
+newtype ModuleName = ModuleName { getModuleName :: Text }
+  deriving (Show, Eq, Ord)
+  deriving newtype ToJSON
 
-data StartOrEnd = Start Phase | End Phase deriving Show
+data Module = Module { moduleUnitId :: UnitName
+                     , moduleName :: ModuleName } deriving (Eq, Ord, Generic)
 
-getStartOrEndMarker :: StartOrEnd -> Marker
-getStartOrEndMarker (Start m) = phaseStart m
-getStartOrEndMarker (End m) = phaseEnd m
+newtype UnitName = UnitName { getUnitName :: Text }
+  deriving (Show, Eq, Ord)
+  deriving newtype ToJSON
 
-getTimeSorE :: ModuleSpan -> StartOrEnd -> Double
-getTimeSorE ms sore = getTime ms (getStartOrEndMarker sore)
+data Node = Node {
+              nodeModule :: Module,
+              nodePhase :: Phase
+              }  deriving (Ord, Eq)
+
+newtype ModuleNode = ModuleNode Module deriving (Ord, Eq)
+
+instance Show ModuleNode where
+  show (ModuleNode m) = show m
+
+instance Show Module where
+  show (Module u p) = T.unpack (getModuleName p) <> ":" <> T.unpack (getUnitName u)
+
+instance Show Node where
+  show (Node m p) = show p <> ":" <> show m
+
+data Duration a = Duration a Double Double deriving Show
+
+instance Show a => ToJSON (Duration a) where
+  toJSON (Duration node cur_time dur) = object ["name" .= show node, "start" .= cur_time, "end" .= (cur_time + dur)]
+
+durationToInstants :: Duration a -> [Instant a]
+durationToInstants (Duration node start dur) = [Instant start node Start, Instant (start + dur) node End]
+
+-- | Returns an ordered list
+toInstants :: [Duration a] -> [Instant a]
+toInstants = sortBy (comparing time) . concatMap durationToInstants
+
+data Instant a = Instant {
+                 time :: Double
+                 , instantNode :: a
+                 , instanceDir :: StartOrEnd
+                 }
+
+data StartOrEnd = Start | End
+
+
+getStartTime :: ModuleSpan -> Phase -> Double
+getStartTime ms = getTime ms . phaseStart
 
 getTime :: ModuleSpan -> Marker -> Double
 getTime ModuleSpan{..} m =
@@ -224,7 +300,7 @@ markers = enumFrom StartComp
 phases :: [Phase]
 phases = enumFrom Parse
 
-match :: [(Text, Marker, Double)] -> [ModuleSpan]
+match :: [(Module, Marker, Double)] -> [ModuleSpan]
 match xss = go (normalise (sort xss))
   where
     -- Account for if codegen runs multiple times
@@ -233,7 +309,7 @@ match xss = go (normalise (sort xss))
     normalise (x:xs) = x : normalise xs
     normalise [] = []
 
-    go :: [(Text, Marker, Double)] -> [ModuleSpan]
+    go :: [(Module, Marker, Double)] -> [ModuleSpan]
     go [] = []
     go xs =
         let (prefix, ys) = splitAt (length markers) xs
@@ -244,20 +320,24 @@ match xss = go (normalise (sort xss))
     -- Only *needs* the Start/End events, the other events are filled in with End
     -- if they are missing. This is convenient for hs-boot files which don't have
     -- a codegen phase
-    check :: [Marker] -> [(Text, Marker, Double)] -> ([Double], [(Text, Marker, Double)])
+    check :: [Marker] -> [(Module, Marker, Double)] -> ([Double], [(Module, Marker, Double)])
     check (expected_dir:dirs) ((_l, dir, ts):xs)
       | expected_dir == dir = let (rest, leftover) = check dirs xs
                               in (ts: rest, leftover)
       | otherwise = if dir == EndComp then (replicate (length dirs + 1) ts, xs) else error "No"
     check _ _ = ([], [])
 
-data EL = EL { offset :: Double, caps :: !Int,  spans :: ![(Text, Marker, Double)], mods :: !(Map.Map Text [Text]) }
+data EL = EL { offset :: Double
+             , caps :: !Int
+             , spans :: ![(Module, Marker, Double)]
+             , mods :: !(Map.Map Module [Module])
+             , units :: !(Map.Map UnitName [UnitName]) }
 
 nanoToMilli :: Integral n => n -> Double
 nanoToMilli n = (fromIntegral n) / 1_000_000
 
 process :: EventLog -> EL
-process (EventLog _ (Data es)) = foldl' processEvent (EL undefined 1 [] Map.empty) es
+process (EventLog _ (Data es)) = foldl' processEvent (EL undefined 1 [] Map.empty Map.empty) es
 
 processEvent :: EL -> Event -> EL
 processEvent el (Event t ei _) = processEventInfo t ei el
@@ -272,20 +352,36 @@ processEventInfo t (UserMarker m) el = do
     Just (m', d) -> el { spans = (m', d, nanoToMilli t + o) : spans el }
     Nothing -> case parseMod m of
                  Just (m', deps) -> el { mods = Map.insert m' deps (mods el) }
-                 Nothing -> el
+                 Nothing -> case parsePackage m of
+                              Just (un, udeps) -> el { units = Map.insert un udeps (units el)}
+                              Nothing -> el
+
 
 
 processEventInfo _ _ el = el
 
 
-parseMod :: Text -> Maybe (Text, [Text])
+parseMod :: Text -> Maybe (Module, [Module])
 parseMod t = do
-  ["MOD", modu, deps] <- return $ T.splitOn ":" t
-  return (modu, (map T.pack (read (T.unpack deps))))
+  ["MOD", info, deps_info] <- return $ T.splitOn ":" t
+  modu <- parseModule info
+  deps <- map (\(a,b) -> Module (UnitName a) (ModuleName b)) <$> readMaybe (T.unpack deps_info)
+  return (modu, deps)
 
-parseMessage :: Text -> Maybe (Text, Marker)
+parsePackage :: Text -> Maybe (UnitName, [UnitName])
+parsePackage t = do
+  ("PACKAGES": modu: deps) <- return $ T.splitOn ":" t
+  return (UnitName modu, (map (UnitName . T.pack) (map T.unpack deps)))
+
+parseModule :: Text -> Maybe Module
+parseModule info = do
+  (unit, modu) <- readMaybe (T.unpack info)
+  return (Module (UnitName unit) (ModuleName modu))
+
+parseMessage :: Text -> Maybe (Module, Marker)
 parseMessage t = do
-  (raw_dir: modu:_) <- return $ T.splitOn ":" t
+  (raw_dir: info:_) <- return $ T.splitOn ":" t
+  modu <- parseModule info
   dir <- parseDir raw_dir
   return (modu, dir)
 parseDir :: Text -> Maybe Marker
@@ -326,6 +422,7 @@ htmlHeader dat  =
 timeline :: Text
 timeline = decodeUtf8 $(embedFile "timeline.js")
 
+
 template :: Value -> Html
 template dat = docTypeHtml $ do
 --  H.stringComment $ "Generated with -" <> showVersion version
@@ -336,34 +433,23 @@ template dat = docTypeHtml $ do
     script $ preEscapedToHtml timeline
 
 -- Analysis script in Python <3
-genPyDag :: Int -> Double -> [(Text, Marker, Double)] -> Map.Map Node (Double, [Node]) -> String
+genPyDag :: Show a => Int -> Double -> [Instant a] -> Map.Map a (Double, [a]) -> String
 genPyDag caps total_time spans dag =
   let edges = Map.toList dag
-      renderNode (Node p l ) = T.pack (show p) <> ":" <> l
+      renderNode = T.pack . show
       mkEdge :: Text -> Text -> Double -> String
       mkEdge from_edge to_edge weight = "G.add_edge (" ++ show from_edge ++ "," ++ show to_edge ++ ", weight=" ++ show weight ++ (if weight>0 then ", capacity=1" else "") ++ ")"
       mkOne (t, (w, ds)) =
-        let internal_node = "END:" <> renderNode t
-        in (mkEdge (renderNode t) internal_node w) : map (\end -> mkEdge internal_node (renderNode end) 0) ds
+        let internal_node = "START:" <> renderNode t
+        in (mkEdge internal_node (renderNode t) w) : map (\end -> mkEdge (renderNode end) internal_node 0) ds
          -- Intermediate edge
       added_edges = unlines (concatMap mkOne edges)
 
-
-      t0 = minimum [t | (_, _, t) <- spans ]
-      spans' = sortBy (comparing (\(_, _, c) -> c)) spans
-      mkEvent (l, d, t) = (t - t0, l,  show d)
-      events = "events = " ++ show (map mkEvent spans')
+      mkEvent (Instant time node dir) = (time, show node,  showSorE dir)
+      showSorE (Start {}) = "S" :: String
+      showSorE (End{}) = "E" :: String
+      events = "events = " ++ show (map mkEvent spans)
   in pyScript caps total_time added_edges events
-
-{-
-for node, outdegree in G.out_degree(G.nodes()):
-    if outdegree == 0:
-        G.add_edge(node, "SINK", weight=0.01)
-
-for node, indegree in G.in_degree(G.nodes()):
-    if indegree == 0:
-        G.add_edge("SOURCE", node, weight=0.01)
-        -}
 
 
 rawPScript :: Text
@@ -383,91 +469,74 @@ pyScript _caps _total_time added events = unlines $
   , events
   , T.unpack $ rawPScript ]
 
-{-
-  , "longest = nx.dag_longest_path(G)"
-  , "longest_length = nx.dag_longest_path_length(G)"
-  , "print(longest)"
-  , "total_time = sum([d['weight'] for (u, v, d) in G.edges(data=True)])"
-  , "print(\"Critical path length: {0:.2f}s\".format(longest_length / 1000))"
-  , "print(\"Actual time: {0:.2f}s\".format(" ++ show total_time ++ " / 1000))"
-  , "caps = " ++ show caps
-  , "print(\"Theoretical minimum build time ({0:d} cores): {1:.2f}s\".format(caps, (total_time / (1000 * caps))))"
-  ]
-  -}
-
-data SimState = SimState { n_jobs :: !Int
+data SimState a = SimState { n_jobs :: !Int
                          , start_period :: !Double
                          , durs :: !(Map.Map Int Double)
-                         , active :: !(Set.Set Text)
-                         , lags :: ![(Text, Double)]
+                         , active :: !(Set.Set a)
+                         , lags :: ![(a, Double)]
                          } deriving Show
 
 -- An accurate simulation of what actually happened
-simulate :: [(Text, StartOrEnd, Double)] -> SimState
-simulate spans = foldl' go (SimState 0 t0 Map.empty Set.empty mempty) spans'
+simulate :: Ord a => [Instant a] -> SimState a
+simulate spans = foldl' go (SimState 0 t0 Map.empty Set.empty mempty) spans
   where
-    spans' = sortBy (comparing (\(_, _, c) -> c)) spans
-    (_, _, t0) = head spans'
+    t0 = time (head spans)
 
 
-    go :: SimState -> (Text, StartOrEnd, Double) -> SimState
-    go (SimState{..}) (node, dir, time)  =
+    go :: Ord a => SimState a -> Instant a -> SimState a
+    go (SimState{..}) (Instant time node sore)  =
       let period_time = time - start_period
           durs' = Map.insertWith (+) n_jobs period_time durs
-          n_jobs' = if isStart dir then n_jobs + 1 else n_jobs - 1
-          active' = if isStart dir then Set.insert node active else Set.delete node active
+          n_jobs' = case sore of
+                      Start -> n_jobs + 1
+                      End -> n_jobs - 1
+          active' = case sore of
+                      Start -> Set.insert node active
+                      End -> Set.delete node active
           start_period' = time
           lags' = case Set.toList active of
                    [single_node] -> (single_node, period_time) : lags
                    _ -> lags
       in SimState n_jobs' start_period' durs' active' lags'
 
-isStart :: StartOrEnd -> Bool
-isStart (Start _) = True
-isStart (End _) = False
 
-data HypState = HypState { cur_time :: Double
+data HypState a = HypState { cur_time :: Double
                          , capsFree  :: Int
-                         , ready :: [(Node, Double)]
-                         , queue :: PS.OrdPSQ Node Int (Node, Double) -- Invariant, nothing of priority 0 in here.
-                         , action :: PS.OrdPSQ Node Double ()
-                         , traces :: [(Text, StartOrEnd, Double)]
+                         , ready :: [(Double, a)]
+                         , queue :: PS.OrdPSQ a Int (Double, a) -- Invariant, nothing of priority 0 in here.
+                         , action :: PS.OrdPSQ a Double ()
+                         , traces :: [Duration a]
                          } deriving Show
 
 -- Assuming k capabilities, how fast could we have gone?
-hypothetical :: Mode -> Map.Map Text [Text] -> [ModuleSpan] -> Int -> [(Text, StartOrEnd, Double)]
-hypothetical mode deps mss caps = reverse $ traces $ go (HypState 0 caps initReady initialQueue PS.empty [])
+hypothetical :: forall a . (Show a, Ord a) => Map.Map a (Double, [a]) -> Int -> [Duration a]
+hypothetical deps caps = reverse $ traces $ go (HypState 0 caps initReady initialQueue PS.empty [])
   where
 
-    mod_deps' :: Map.Map Node [Node]
-    mod_deps' = mkDependencyTree mode deps
+    revDeps :: Map.Map a [a]
+    revDeps = Map.fromListWith (++) $ concatMap (\(m, (_, ms)) -> map (,[m]) ms) $ Map.toList deps
 
-    revDeps :: Map.Map Node [Node]
-    revDeps = Map.fromListWith (++) $ concatMap (\(m, ms) -> map (,[m]) ms) $ Map.toList mod_deps'
-    numDeps k m = maybe 0 length (Map.lookup (Node k (name m)) mod_deps')
     initReady = map (\(_, _, c) -> c) initReady'
-
     (initReady', initialQueue) =
-      PS.atMostView 0 (PS.fromList (concatMap (\ms -> [(Node p (name ms), numDeps p ms, (Node p (name ms), getPhaseTime ms p)) | p <- phases]) mss))
-
-    mkAction :: Double -> (Node, Double) -> (Text, StartOrEnd, Double)
-    mkAction cur_time (Node d l, t) =
-        let k = (l, End d, end_time)
-            end_time = cur_time + t
-        in k
-
-    mkStart :: Double -> (Node, a) -> (Text, StartOrEnd, Double)
-    mkStart cur_time (Node d l, _) = (l, Start d, cur_time)
+      PS.atMostView 0 (PS.fromList allEdges)
 
 
-    alterDeps :: PS.OrdPSQ Node Int a -> Node -> (PS.OrdPSQ Node Int a, Maybe a)
+    allEdges :: [(a, Int, (Double, a))]
+    allEdges = [(n, length ds, (t, n)) | (n, (t, ds)) <- Map.toList deps]
+
+
+    mkTrace :: Double -> (Double, a) -> Duration a
+    mkTrace cur_time (dur, n) = Duration n cur_time dur
+
+
+    alterDeps :: PS.OrdPSQ a Int b -> a -> (PS.OrdPSQ a Int b, Maybe b)
     alterDeps ps l = swap $ PS.alter f l ps
       where
         f Nothing = error ("Bad key:" ++ show l)
         f (Just (p, v)) = if p == 1 then (Just v, Nothing)
                                      else (Nothing, Just (p - 1, v))
 
-    go :: HypState -> HypState
+    go :: HypState a -> HypState a
     go h@(HypState{..}) =
       case capsFree of
         -- caps free, and jobs ready, start them
@@ -475,10 +544,9 @@ hypothetical mode deps mss caps = reverse $ traces $ go (HypState 0 caps initRea
           let (new_jobs, todo_jobs) = splitAt c ready -- Could use a smarter scheduler
               new_jobs_n = length new_jobs
               new_free_caps = c - new_jobs_n
-              action' = foldr (\(l,t) am -> (PS.insert l (cur_time + t) () am)) action new_jobs
-              starts  = map (mkStart cur_time) new_jobs
-              ends  = map (mkAction cur_time) new_jobs
-              new_traces = ends ++ starts ++ traces
+              action' = foldr (\(t, l) am -> (PS.insert l (cur_time + t) () am)) action new_jobs
+              durs  = map (mkTrace cur_time) new_jobs
+              new_traces = durs ++ traces
           in go (HypState{capsFree = new_free_caps, ready = todo_jobs, traces = new_traces, action = action', .. })
         -- Otherwise, advance time until a job finishes and release the cap
         _ -> case PS.minView action of

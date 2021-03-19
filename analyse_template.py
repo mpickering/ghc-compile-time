@@ -71,7 +71,7 @@ print("If each module took 1s to compile..: {0:.2f}s".format(longest_length2))
 
 fig, ax = plt.subplots(figsize=(100,100))
 
-G=nx.relabel_nodes(G, lambda x: remove_prefix(x, "END:"))
+G=nx.relabel_nodes(G, lambda x: remove_prefix(x, "START:"))
 G.remove_edges_from(nx.selfloop_edges(G))
 ls = single_source_longest_dag_path_length(G, "SOURCE")
 print(ls)
@@ -84,19 +84,22 @@ n_jobs = 0
 Writer = animation.writers['ffmpeg']
 writer = Writer(fps=1, metadata=dict(artist='Me'), bitrate=30000)
 
+min_time = min([x[0] for x in events])
+max_time = max([x[0] for x in events])
+
 def update(frames):
     global events, n_jobs, event_state
-    current_time = frames * 1000
+    current_time = min_time + (frames * 1000)
     print(current_time)
     take, drop = itertools.tee(events)
     new_events = itertools.takewhile(lambda x: x[0] < current_time, take)
     events = itertools.dropwhile(lambda x: x[0] < current_time, drop)
     for (t, node, event) in new_events:
         print(t, node, event)
-        if event == "Start":
+        if event == "S":
             event_state[node] = "RUNNING"
             n_jobs += 1
-        if event == "End":
+        if event == "E":
             event_state[node] = "FINISHED"
             n_jobs -= 1
 
@@ -116,7 +119,7 @@ def update(frames):
 
 #nx.draw(G, pos, with_labels=False)
 #nx.draw_networkx_labels(G, pos, font_color="red", horizontalalignment='left', font_size=8, verticalalignment="bottom")
-ani = animation.FuncAnimation(fig, update, frames=(math.ceil(events[-1][0]/1000)+10), interval=200)
+ani = animation.FuncAnimation(fig, update, frames=(math.ceil(events[-1][0]/1000)+10), interval=500)
 #ani.save('modules.mp4', writer=writer)
-update(0)
+#update(0)
 plt.show()
