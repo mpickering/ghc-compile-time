@@ -21,6 +21,6 @@ executable ghc-compile-time-analyse
   main-is:             Main.hs
   -- other-modules:
   -- other-extensions:
-  build-depends:       base >=4.14 && <4.15, ghc-events >= 0.16, blaze-html, file-embed, text, aeson, containers, psqueues
+  build-depends:       base >=4.14 && <4.15, ghc-events >= 0.16, blaze-html, file-embed, text, aeson, containers, psqueues, directory, filepath
   -- hs-source-dirs:
   default-language:    Haskell2010

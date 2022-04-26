@@ -9,7 +9,10 @@
 {-# LANGUAGE GeneralisedNewtypeDeriving #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -Wall #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE DeriveFunctor #-}
 module Main(main) where
 
 import Data.Aeson (Value, encode, ToJSON, toJSON, object, (.=))
@@ -38,33 +41,55 @@ import Text.Printf
 import qualified Data.OrdPSQ as PS
 import Data.Maybe (fromMaybe, catMaybes)
 import Data.Tuple (swap)
-import Control.Monad (forM_)
+import Control.Monad (forM_, forM, guard)
 import Text.Read
 import Data.Coerce
+import System.Directory
+import System.FilePath
 
 
 data Mode = Simple | Hypothetical
 
 main :: IO ()
 main = do
-  [el] <- getArgs
+  [dir] <- getArgs
+--  els <- listDirectory dir
+  --res <- parseMany dir els
+  --runAnalyis res
+--  generateModule dir
+  {-
   generateDetailed el
   generateModule el
+  -}
+
+  core_graph <- readCoreGraph dir
+  writeFile "analyse.py" (genPyDag 1 0 [] [] core_graph)
+  runCoreAnalysis core_graph
+
+parseMany :: FilePath -> [FilePath] -> IO Result
+parseMany  dir fps = fmap (mconcat . catMaybes) . forM fps $ \fp -> do
+  print fp
+  Right !events <- readEventLogFromFile (dir </> fp)
+  let !EL{..} = process fp events
+  -- This is a simple check to see if the eventlog was from compiling a package or not
+  print (unitTimes result)
+  return $ if Map.null (units result)
+    then  Nothing
+    else Just result
 
 
-
-detailed :: Mode -> EL -> (Map.Map Node [Node], [Duration Node])
-detailed mode = (\EL{..} -> ( mkDependencyTree mode mods
+detailed :: Mode -> Result -> (Map.Map Node [Node], [Duration Node])
+detailed mode = (\Result{..} -> ( mkDependencyTree mode mods
                             , mkDurationNode (match spans) ))
 
 generateDetailed :: FilePath -> IO ()
 generateDetailed =
   generate (detailed Simple)
 
-simple :: EL
+simple :: Result
        -> (Map.Map ModuleNode [ModuleNode],
            [Duration ModuleNode])
-simple = (\EL{..} -> ( Map.mapKeys ModuleNode (coerce mods)
+simple = (\Result{..} -> ( Map.mapKeys ModuleNode (coerce mods)
                        , mkDurationModule (match spans) ) )
 
 generateModule :: FilePath -> IO ()
@@ -72,39 +97,113 @@ generateModule =
   generate simple
 
 generate :: (Show a, Ord a)
-         => (EL -> (Map.Map a [a], [Duration a]))
+         => (Result -> (Map.Map a [a], [Duration a]))
          -> FilePath
          -> IO ()
 generate f el_f = do
   Right events <- readEventLogFromFile el_f
-  let el@EL{..} = process events
-      (deps, dur) = f el
-      times = [t | (_, _, t) <- spans]
+  let el@EL{result=Result{..}} = process el_f events
+  runAnalysis (result el)
+
+
+optics = UnitName "optics-core-0.4-2115a1ecc5fa542a6970529b64c66e221bf61df8313a8f602665b32491d74a4d"
+
+
+
+runAnalysis :: Result -> IO ()
+runAnalysis r@Result{..} = do
+  let times = [t | (_, _, t) <- spans]
       total_time = maximum times - minimum times
+--      deps = detailed --units
+--      dur = Map.elems unitTimes
+      (deps, dur) = simple r
+--      deps' = simplifyEdges deps
   let insts = toInstants dur
-      h = template (toJSON dur)
+--      dur' = (fmap PackageNode <$> dur)
+  let  h = template (toJSON dur)
   writeFile "test.html" (renderHtml h)
-  writeFile "analyse.py" (genPyDag caps total_time insts (genGraph dur deps))
   let s = simulate insts
   printSimulation "REAL" s
   let hcaps = 6
       g = genGraph dur deps
-      (simple_deps, simple_dur) = detailed Hypothetical el
-      g' = genGraph simple_dur simple_deps
-  let hs = simulate $ toInstants $ hypothetical g' hcaps
-  let simple_hs = simulate $ toInstants $ hypothetical g hcaps
-  printSimulation ("Hypothetical caps=" ++ show hcaps) hs
-  printSimulation ("Real caps=" ++ show hcaps) simple_hs
+      (simple_deps, simple_dur) = detailed Simple r
+      g' = genGraph (fmap PackageNode <$> simple_dur) (simplifyEdges simple_deps)
+      (simple_deps', simple_dur') = detailed Hypothetical r
+      g'' = genGraph simple_dur' simple_deps'
+--  print (sum (map duration simple_dur))
+  print (sum (map duration dur))
+--  print (Map.size simple_deps)
+  print (Map.size deps)
+  --print (sum (map fst (Map.elems g)))
+--  print (sum (map fst (Map.elems g')))
+--  print (sum (map fst (Map.elems g'')))
+--  let hs = simulate $ toInstants $ hypothetical g' hcaps
+  let hyp = hypothetical g hcaps
+--  print hyp
+  let simple_hs = simulate $ toInstants $ hyp
+--  print simple_hs
+      hs' = simulate $ toInstants $ hypothetical g' hcaps
+--  let simple_hs' = simulate $ toInstants $ hypothetical g'' hcaps
+--  printSimulation ("Hypothetical caps(S)=" ++ show hcaps) hs
+--  printSimulation ("Hypothetical caps(D)=" ++ show hcaps) simple_hs'
+
+  printSimulation ("Package = 1, -j=" ++ show hcaps) simple_hs
+  return ()
+  printSimulation ("Package = jsem, -j=" ++ show hcaps) hs'
+
+  let new = simulateJsem14905 r
+      hyp_new = hypothetical new 6
+      hs_new = simulate $ toInstants $ hyp_new
+  writeFile "analyse.py" (genPyDag 1 0 insts [] g)
+  printSimulation ("PAR") hs_new
+
+
+type DepMap a = Map.Map a (Double, [a])
+
+simulateCurrent :: Result -> DepMap UnitName
+simulateCurrent Result{..} = genGraph (Map.elems unitTimes) units
+simulateJsem :: Result -> DepMap (PackageWrapper Node)
+simulateJsem r =
+  let (simple_deps, simple_dur) = detailed Simple r
+  in genGraph (fmap PackageNode <$> simple_dur) (simplifyEdges simple_deps)
+simulateJsem14905 :: Result -> DepMap (PackageWrapper Node)
+simulateJsem14905 r =
+  let (simple_deps, simple_dur) = detailed Hypothetical r
+  in genGraph (fmap PackageNode <$> simple_dur) (simplifyEdges simple_deps)
+
+
+simulateOne :: (Show a, Ord a) => DepMap a -> Int -> Map.Map Int Double
+simulateOne g caps = durs $ simulate $ toInstants $ hypothetical g caps
+
+runCoreAnalysis :: DepMap Int -> IO ()
+runCoreAnalysis dm = do
+  forM_ [1..32] $ \caps -> do
+    let res = simulateOne dm caps
+    print $ show caps ++ ": " ++ show (sum (map snd $ Map.toList res))
+
+runAnalysis2 :: Result -> IO ()
+runAnalysis2 r = do
+  let instants caps = [("current", simulateOne (simulateCurrent r) caps)
+                      ,("jsem", simulateOne (simulateJsem r) caps)
+                      ,("jsem-14905", simulateOne (simulateJsem14905 r) caps)]
+  putStrLn (intercalate "," ("caps" : map fst (instants 0)))
+  forM_ [1..32] $ \caps -> compareTime caps (map snd (instants caps))
+
+-- Different scenarios to simulate
+-- * Current behaviour (-j1 Cabal -j)
+-- * Jsem (-jsem Cabal -j)
+-- * Jsem + Hypothetical edges
+
 
 mkDurationNode :: [ModuleSpan] -> [Duration Node]
 mkDurationNode mss =
   [(Duration (Node name p) (getStartTime ms p) (getPhaseTime ms p)) | p <- phases, ms@ModuleSpan{..} <- mss]
 
 
-compareTime :: Int -> SimState a -> SimState a -> IO ()
-compareTime n h c = putStrLn $ (show n) ++ "," ++ (time h) ++ "," ++ (time c)
+compareTime :: Int -> [Map.Map Int Double] -> IO ()
+compareTime n ms = putStrLn $ (show n) ++ concatMap (\m -> "," ++ (time m)) ms
   where
-    time s = show (sum (map snd (Map.toList (durs s))) / 1000)
+    time s = show (sum (map snd (Map.toList s)) / 1000)
 
 
 printSimulation :: Show a => String -> SimState a -> IO ()
@@ -192,18 +291,42 @@ mkDurationModule :: [ModuleSpan] -> [Duration ModuleNode]
 mkDurationModule mss =
   [Duration (ModuleNode (name ms)) (start ms) (end ms - start ms) | ms <- mss]
 
+-- Rewrite internal pointing edges to PackageFinished nodes
+simplifyEdges :: Map.Map Node [Node] -> Map.Map (PackageWrapper Node) [(PackageWrapper Node)]
+simplifyEdges dep_map = Map.fromListWith (++) $ concatMap go $ Map.toList dep_map
+  where
+    go :: (Node, [Node]) -> [(PackageWrapper Node, ([PackageWrapper Node]))]
+    go (old_n@(getNodeUnit -> uid), ns) =
+      (PackageFinished uid, [PackageNode old_n]) :
+      (PackageNode old_n, map (\n -> if getNodeUnit n == uid then (PackageNode n) else (PackageFinished (getNodeUnit n)) ) ns) : []
 
+-- Simplifier the graph starting from a specific place
+cullFrom :: Ord a => a -> Map.Map a [a] -> Map.Map a [a]
+cullFrom start m = case vs of
+                      Just ns -> foldr cullFrom m' ns
+                      Nothing -> m'
+  where
+    (vs, m') = Map.updateLookupWithKey (\_ _ -> Nothing) start m
+
+getNodeUnit :: Node -> UnitName
+getNodeUnit (Node (Module uid' _) _) = uid'
 
 -- | This prunes the dependencies so that only nodes with times are kept in the graph.
-genGraph :: Ord a
+genGraph :: (Show a, Ord a)
           => [Duration a]
           -> Map.Map a [a] -- Dependencies
           -> Map.Map a (Double, [a])
 genGraph dur mod_deps = final_map
   where
-    times = Map.fromList [(n, d) | Duration n _s d <- dur]
-    care = Map.keys times
-    final_map = Map.merge Map.dropMissing Map.dropMissing (Map.zipWithMatched (\_ time mods -> (time, care `intersect` mods))) times mod_deps
+    times = Map.fromListWith (error "clash") [(n, d) | Duration n _s d <- dur]
+    care = Map.keys mod_deps
+    k :: Show a => Map.SimpleWhenMissing a Double (Double, [a])
+    k = Map.mapMissing (\k x -> error (show k ++ show x))
+
+    g :: Map.SimpleWhenMissing a [a] (Double, [a])
+    g = Map.mapMissing (\k x -> (0, x))
+
+    final_map = Map.merge k g (Map.zipWithMatched (\_ time mods -> (time, care `intersect` mods))) times mod_deps
 
 
 
@@ -223,6 +346,12 @@ data Marker = StartComp | RN | TC | CGStart | CGEnd | EndComp deriving (Show, Or
 
 data Phase = Parse | TypeCheck | CodeGen deriving (Show, Enum, Ord, Eq)
 
+data PackageWrapper a = PackageFinished UnitName | PackageNode a deriving (Eq, Ord)
+
+instance Show a => Show (PackageWrapper a) where
+  show (PackageFinished un) = "FIN:" ++ T.unpack (getUnitName un)
+  show (PackageNode a) = show a
+
 newtype ModuleName = ModuleName { getModuleName :: Text }
   deriving (Show, Eq, Ord)
   deriving newtype ToJSON
@@ -231,8 +360,11 @@ data Module = Module { moduleUnitId :: UnitName
                      , moduleName :: ModuleName } deriving (Eq, Ord, Generic)
 
 newtype UnitName = UnitName { getUnitName :: Text }
-  deriving (Show, Eq, Ord)
+  deriving (Eq, Ord)
   deriving newtype ToJSON
+
+instance Show UnitName where
+  show (UnitName u) = show u
 
 data Node = Node {
               nodeModule :: Module,
@@ -240,6 +372,7 @@ data Node = Node {
               }  deriving (Ord, Eq)
 
 newtype ModuleNode = ModuleNode Module deriving (Ord, Eq)
+
 
 instance Show ModuleNode where
   show (ModuleNode m) = show m
@@ -250,7 +383,11 @@ instance Show Module where
 instance Show Node where
   show (Node m p) = show p <> ":" <> show m
 
-data Duration a = Duration a Double Double deriving Show
+data Duration a =
+      Duration { durationValue :: a
+               , durationStart :: Double
+               , duration :: Double } deriving (Show, Functor)
+
 
 instance Show a => ToJSON (Duration a) where
   toJSON (Duration node cur_time dur) = object ["name" .= show node, "start" .= cur_time, "end" .= (cur_time + dur)]
@@ -324,20 +461,38 @@ match xss = go (normalise (sort xss))
     check (expected_dir:dirs) ((_l, dir, ts):xs)
       | expected_dir == dir = let (rest, leftover) = check dirs xs
                               in (ts: rest, leftover)
-      | otherwise = if dir == EndComp then (replicate (length dirs + 1) ts, xs) else error "No"
+      | otherwise = if dir == EndComp then (replicate (length dirs + 1) ts, xs) else error (show expected_dir ++ show dir ++ show xs)
     check _ _ = ([], [])
 
 data EL = EL { offset :: Double
-             , caps :: !Int
-             , spans :: ![(Module, Marker, Double)]
+             , result :: !Result }
+
+
+data Result = Result { spans :: ![(Module, Marker, Double)]
              , mods :: !(Map.Map Module [Module])
-             , units :: !(Map.Map UnitName [UnitName]) }
+             , units :: !(Map.Map UnitName [UnitName])
+             , unitTimes :: !(Map.Map UnitName (Duration UnitName))}
+
+instance Monoid Result where
+  mempty = Result mempty mempty mempty mempty
+
+instance Semigroup Result where
+  (Result s1 m1 u1 ut1) <> (Result s2 m2 u2 ut2) = Result (s1 ++ s2) (Map.union m1 m2) (Map.union u1 u2) (Map.union ut1 ut2)
+
+updateResult :: (Result -> Result) -> EL -> EL
+updateResult f el = el { result = f (result el) }
 
 nanoToMilli :: Integral n => n -> Double
 nanoToMilli n = (fromIntegral n) / 1_000_000
 
-process :: EventLog -> EL
-process (EventLog _ (Data es)) = foldl' processEvent (EL undefined 1 [] Map.empty Map.empty) es
+process :: FilePath -> EventLog -> EL
+process fp (EventLog _ (Data es)) =
+  let res@EL{..} = foldl' processEvent (EL (error fp) mempty) es
+      times = mkDurationModule (match (spans result))
+      min_time = minimum (map durationStart times)
+      total_time = sum (map duration times)
+      [unit] = Map.keys (units result)
+  in res {result = result { unitTimes = Map.map (\_ -> Duration unit min_time total_time) (units result)  }}
 
 processEvent :: EL -> Event -> EL
 processEvent el (Event t ei _) = processEventInfo t ei el
@@ -345,15 +500,14 @@ processEvent el (Event t ei _) = processEventInfo t ei el
 
 processEventInfo :: Timestamp -> EventInfo -> EL -> EL
 processEventInfo t (WallClockTime _ s ns) el = el { offset = ((fromIntegral s * 1_000) + (nanoToMilli ns)) - nanoToMilli t }
-processEventInfo _t (CapCreate _n) el = el { caps = 1 + (caps el) }
 processEventInfo t (UserMarker m) el = do
   let o = offset el
   case parseMessage m of
-    Just (m', d) -> el { spans = (m', d, nanoToMilli t + o) : spans el }
+    Just (m', d) -> updateResult (\r -> r { spans = (m', d, nanoToMilli t + o) : spans r }) el
     Nothing -> case parseMod m of
-                 Just (m', deps) -> el { mods = Map.insert m' deps (mods el) }
+                 Just (m', deps) -> updateResult (\r -> r { mods = Map.insert m' deps (mods r) }) el
                  Nothing -> case parsePackage m of
-                              Just (un, udeps) -> el { units = Map.insert un udeps (units el)}
+                              Just (un, udeps) -> updateResult (\r -> r { units = Map.insert un udeps (units r)}) el
                               Nothing -> el
 
 
@@ -371,6 +525,7 @@ parseMod t = do
 parsePackage :: Text -> Maybe (UnitName, [UnitName])
 parsePackage t = do
   ("PACKAGES": modu: deps) <- return $ T.splitOn ":" t
+  guard (modu /= "main")
   return (UnitName modu, (map (UnitName . T.pack) (map T.unpack deps)))
 
 parseModule :: Text -> Maybe Module
@@ -433,9 +588,11 @@ template dat = docTypeHtml $ do
     script $ preEscapedToHtml timeline
 
 -- Analysis script in Python <3
-genPyDag :: Show a => Int -> Double -> [Instant a] -> Map.Map a (Double, [a]) -> String
-genPyDag caps total_time spans dag =
+genPyDag :: (Ord a, Show a) => Int -> Double -> [Instant a] -> [(String, [(Double, Int)])] -> Map.Map a (Double, [a]) -> String
+genPyDag caps total_time instants chart_info dag =
   let edges = Map.toList dag
+      (spans) =  instants
+--      simstate = simulate spans
       renderNode = T.pack . show
       mkEdge :: Text -> Text -> Double -> String
       mkEdge from_edge to_edge weight = "G.add_edge (" ++ show from_edge ++ "," ++ show to_edge ++ ", weight=" ++ show weight ++ (if weight>0 then ", capacity=1" else "") ++ ")"
@@ -448,8 +605,13 @@ genPyDag caps total_time spans dag =
       mkEvent (Instant time node dir) = (time, show node,  showSorE dir)
       showSorE (Start {}) = "S" :: String
       showSorE (End{}) = "E" :: String
-      events = "events = " ++ show (map mkEvent spans)
-  in pyScript caps total_time added_edges events
+      events = "events =" ++ show (map mkEvent spans)
+      gen (l, spans) = let (xs, ys) = unzip (sort $ spans)
+                       in (xs, ys, l)
+      c = unlines [
+              "charts = " ++ show (map gen chart_info)
+        ]
+  in pyScript caps total_time added_edges events c
 
 
 rawPScript :: Text
@@ -457,8 +619,9 @@ rawPScript = decodeUtf8 $(embedFile "analyse_template.py")
 
 
 
-pyScript :: Int -> Double -> String -> String -> String
-pyScript _caps _total_time added events = unlines $
+
+pyScript :: Int -> Double -> String -> String -> String -> String
+pyScript _caps _total_time added events chart = unlines $
   [ "import networkx as nx"
   , "import matplotlib.pyplot as plt"
   , "import matplotlib.animation as animation"
@@ -467,18 +630,20 @@ pyScript _caps _total_time added events = unlines $
   , "G = nx.DiGraph()"
   , added
   , events
+  , chart
   , T.unpack $ rawPScript ]
 
 data SimState a = SimState { n_jobs :: !Int
                          , start_period :: !Double
                          , durs :: !(Map.Map Int Double)
+                         , chart :: ![(Double, Int)]
                          , active :: !(Set.Set a)
                          , lags :: ![(a, Double)]
                          } deriving Show
 
 -- An accurate simulation of what actually happened
 simulate :: Ord a => [Instant a] -> SimState a
-simulate spans = foldl' go (SimState 0 t0 Map.empty Set.empty mempty) spans
+simulate spans = foldl' go (SimState 0 t0 Map.empty [] Set.empty mempty) spans
   where
     t0 = time (head spans)
 
@@ -487,6 +652,7 @@ simulate spans = foldl' go (SimState 0 t0 Map.empty Set.empty mempty) spans
     go (SimState{..}) (Instant time node sore)  =
       let period_time = time - start_period
           durs' = Map.insertWith (+) n_jobs period_time durs
+          chart' = (start_period, n_jobs) : (time, n_jobs) : chart
           n_jobs' = case sore of
                       Start -> n_jobs + 1
                       End -> n_jobs - 1
@@ -497,7 +663,7 @@ simulate spans = foldl' go (SimState 0 t0 Map.empty Set.empty mempty) spans
           lags' = case Set.toList active of
                    [single_node] -> (single_node, period_time) : lags
                    _ -> lags
-      in SimState n_jobs' start_period' durs' active' lags'
+      in SimState n_jobs' start_period' durs' (if period_time == 0 then chart else chart') active' lags'
 
 
 data HypState a = HypState { cur_time :: Double
@@ -559,7 +725,14 @@ hypothetical deps caps = reverse $ traces $ go (HypState 0 caps initReady initia
 
 
 
+readCoreGraph :: FilePath -> IO (Map.Map Int (Double, [Int]))
+readCoreGraph fp = Map.fromList . map (assoc . rl) . lines <$> readFile fp
 
+  where
+    assoc (a,b,c) = (a, (fromIntegral b, filter (/= a) c))
+
+    rl :: String -> (Int, Int, [Int])
+    rl = read
 
 
 

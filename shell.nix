@@ -5,6 +5,7 @@ let
     graph-tool
     networkx
     matplotlib
+    pydot
     # other python packages you want
   ];
   python-with-my-packages = python3.withPackages my-python-packages;
